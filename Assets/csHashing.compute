@@ -1,0 +1,34 @@
+static const int2 offsets2D[9] =
+{
+    int2(-1, 1),
+    int2(0, 1),
+    int2(1, 1),
+    int2(-1, 0),
+    int2(0, 0),
+    int2(1, 0),
+    int2(-1, -1),
+    int2(0, -1),
+    int2(1, -1),
+};
+
+static const int prime1 = 73856093;
+static const int prime2 = 19349663;
+
+int2 GetCell2D(float2 position, float radius)
+{
+    return (int2)floor(position / radius);
+}
+
+
+uint HashCell2D(int2 cell)
+{
+    cell = (uint2)cell;
+    uint a = cell.x * prime1;
+    uint b = cell.y * prime2;
+    return (a + b);
+}
+
+uint KeyFromHash(uint hash, uint tableSize)
+{
+    return hash % tableSize;
+}

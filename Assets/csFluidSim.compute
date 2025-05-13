@@ -1,0 +1,228 @@
+#pragma kernel HashSpace
+#pragma kernel CalculateDensity
+#pragma kernel CalculateForces
+#pragma kernel VelocityHalfStep
+#pragma kernel PositionFullStep
+#pragma kernel CheckCollision
+
+#include "csHashing.compute"
+
+static const int threads = 10;
+
+struct Particle
+{
+    float2 Position;
+    float2 Velocity;
+    float2 Force;
+    float Density;
+    float Pressure;
+};
+
+RWStructuredBuffer<Particle> particles;
+RWStructuredBuffer<uint3> spatialIndices;
+RWStructuredBuffer<uint> spatialOffsets;
+
+uint particleCount;
+
+float kernelRadius;
+
+float poly6KernelScalingFactor;
+
+float spikyGradientScalingFactor;
+
+float viscosityLaplacianScalingFactor;
+
+float mass;
+
+float restDensity;
+
+float stiffness;
+
+float viscosityConstant;
+
+float timestep;
+
+float2 boxMin;
+
+float2 boxMax;
+
+float2 gravity;
+
+float Poly6Kernel(float distance)
+{
+    float kernel = kernelRadius * kernelRadius;
+    float base = kernel - distance;
+    float result = base * base * base;
+    return result;
+}
+
+float SpikyGradient(float distance)
+{
+    float base = kernelRadius - distance;
+    float result = base * base * base;
+    return result;
+}
+
+[numthreads(threads,1,1)]
+void HashSpace (uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= particleCount) return;
+
+    spatialOffsets[id.x] = particleCount;
+    uint index = id.x;
+    int2 cell = GetCell2D(particles[index].Position, kernelRadius);
+    uint hash = HashCell2D(cell);
+    uint key = KeyFromHash(hash, particleCount);
+    spatialIndices[id.x] = uint3(index, hash, key);
+}
+
+float CalculateParticleDensity(uint index)
+{
+    int2 originCell = GetCell2D(particles[index].Position, kernelRadius);
+    float density = 0;
+    for (int i = 0; i < 9; i++)
+    {
+        uint hash = HashCell2D(originCell + offsets2D[i]);
+        uint key = KeyFromHash(hash, particleCount);
+        uint currIndex = spatialOffsets[key];
+        
+
+        while (currIndex < particleCount)
+        {
+            uint3 indexData = spatialIndices[currIndex];
+            currIndex++;
+            
+            if (indexData[2] != key) break;
+            
+            if (indexData[1] != hash) continue;
+
+            uint neighbourIndex = indexData[0];
+
+            float2 neighbourPos = particles[neighbourIndex].Position;
+
+            
+            float2 vectorDistance = neighbourPos - particles[index].Position;
+            float magnitude = (vectorDistance.x * vectorDistance.x + vectorDistance.y * vectorDistance.y);
+            float distance = magnitude * magnitude;
+            if (distance < kernelRadius)
+            {
+                density += mass * poly6KernelScalingFactor * Poly6Kernel(distance);
+            }
+        }
+    }
+    if (density == 0)
+    {
+        density = 0.48;
+    }
+    return density;
+}
+
+float2 CalculateParticleForce(uint index)
+{
+    int2 originCell = GetCell2D(particles[index].Position, kernelRadius);
+    float2 pressureForce = {0.0f, 0.0f};
+    float2 viscosityForce = {0.0f, 0.0f};
+
+    for (int i = 0; i < 9; i++)
+    {
+        uint hash = HashCell2D(originCell + offsets2D[i]);
+        uint key = KeyFromHash(hash, particleCount);
+        uint currIndex = spatialOffsets[key];
+
+        while (currIndex < particleCount)
+        {
+            uint3 indexData = spatialIndices[currIndex];
+            currIndex++;
+            
+            if (indexData[2] != key) break;
+            
+            if (indexData[1] != hash) continue;
+
+            uint neighbourIndex = indexData[0];
+            if (neighbourIndex == index) continue;
+            
+            float2 neighbourPos = particles[neighbourIndex].Position;
+
+            float2 vectorDistance = neighbourPos - particles[index].Position;
+            float distance = (vectorDistance.x * vectorDistance.x + vectorDistance.y * vectorDistance.y);     
+            
+            if (distance < kernelRadius)
+            {
+                pressureForce += -normalize(vectorDistance) * mass *
+                    (particles[index].Pressure + particles[neighbourIndex].Pressure) / (2.0f * particles[neighbourIndex].Density)
+                        * spikyGradientScalingFactor * SpikyGradient(distance);
+
+                viscosityForce += viscosityConstant * mass * (particles[neighbourIndex].Velocity - particles[index].Velocity) /
+                    particles[neighbourIndex].Density * viscosityLaplacianScalingFactor * (kernelRadius - distance);
+            }
+        }
+        
+    }
+    float2 gravityForce = gravity * mass / particles[index].Density;
+    float2 force = gravityForce + viscosityForce + pressureForce;
+    return force;
+}
+
+[numthreads(threads,1,1)]
+void CalculateDensity (uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= particleCount) return;
+    
+    particles[id.x].Density = CalculateParticleDensity(id.x);
+    particles[id.x].Pressure = stiffness * (particles[id.x].Density - restDensity);
+}
+
+[numthreads(threads,1,1)]
+void CalculateForces (uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= particleCount) return;
+    
+    particles[id.x].Force = CalculateParticleForce(id.x);
+}
+
+[numthreads(threads,1,1)]
+void VelocityHalfStep (uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= particleCount) return;
+
+    particles[id.x].Velocity = particles[id.x].Velocity + (particles[id.x].Force / mass) * (timestep / 2);
+}
+
+[numthreads(threads,1,1)]
+void PositionFullStep (uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= particleCount) return;
+
+    float2 positionUpdate = particles[id.x].Velocity * timestep;
+
+    particles[id.x].Position += positionUpdate;
+}
+
+[numthreads(threads,1,1)]
+void CheckCollision (uint3 id : SV_DispatchThreadID)
+{
+    if (particles[id.x].Position.x < boxMin.x)
+    {
+        particles[id.x].Velocity.x *= -0.9f;
+
+        particles[id.x].Position.x = boxMin.x;
+    }
+    if (particles[id.x].Position.y < boxMin.y)
+    {
+        particles[id.x].Velocity.y *= -0.5f;
+
+        particles[id.x].Position.y = boxMin.y;
+    }
+    if (particles[id.x].Position.x > boxMax.x)
+    {
+        particles[id.x].Velocity.x *= -0.9f;
+
+        particles[id.x].Position.x = boxMax.x;
+    }
+    if (particles[id.x].Position.y > boxMax.y)
+    {
+        particles[id.x].Velocity.y *= -0.9f;
+
+        particles[id.x].Position.y = boxMax.y;
+    }
+}
